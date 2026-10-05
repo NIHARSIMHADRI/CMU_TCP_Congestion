@@ -64,6 +64,13 @@ typedef struct {
   // Retained so the backend can recognize a retransmitted SYN-ACK.
   uint32_t local_isn;
   uint32_t peer_isn;
+  // Teardown state is owned by the backend thread.
+  int close_state;
+  int peer_fin_received;
+  int simultaneous_close;
+  uint32_t local_fin_seq;
+  uint32_t peer_fin_seq;
+  int64_t close_deadline;
 } cmu_socket_t;
 
 /*

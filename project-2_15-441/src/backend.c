@@ -100,11 +100,6 @@ static int tcp_handshake(cmu_socket_t *sock) {
   int64_t deadline = monotonic_ms() + DEFAULT_TIMEOUT;
 
   while (1) {
-    pthread_mutex_lock(&sock->death_lock);
-    int dying = sock->dying;
-    pthread_mutex_unlock(&sock->death_lock);
-    if (dying) return EXIT_ERROR;
-
     int64_t remaining = deadline - monotonic_ms();
     if (!waiting_for_syn && remaining <= 0) {
       if (send_handshake_packet(sock, outgoing, sock->local_isn,
@@ -157,6 +152,74 @@ static int tcp_handshake(cmu_socket_t *sock) {
   }
 }
 
+enum { CLOSE_OPEN, CLOSE_WAIT_FIN_ACK, CLOSE_WAIT_ACK, CLOSE_LINGER,
+       CLOSE_DONE };
+
+static int resend_close_packet(cmu_socket_t *sock) {
+  uint8_t flags = sock->close_state == CLOSE_WAIT_ACK
+                      ? FIN_FLAG_MASK | ACK_FLAG_MASK : FIN_FLAG_MASK;
+  uint32_t ack = sock->close_state == CLOSE_WAIT_ACK
+                     ? sock->peer_fin_seq + 1 : 0;
+  return send_handshake_packet(sock, flags, sock->local_fin_seq, ack);
+}
+
+// Called only after window_send has received ACKs for all outgoing data.
+static int start_teardown(cmu_socket_t *sock) {
+  sock->local_fin_seq = sock->window.next_seq_to_send;
+  sock->window.next_seq_to_send++;  // FIN consumes one sequence number.
+  sock->close_state = sock->peer_fin_received ? CLOSE_WAIT_ACK
+                                             : CLOSE_WAIT_FIN_ACK;
+  if (resend_close_packet(sock) < 0) return EXIT_ERROR;
+  sock->close_deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+  return EXIT_SUCCESS;
+}
+
+static void handle_close_packet(cmu_socket_t *sock, cmu_tcp_header_t *hdr) {
+  if (get_payload_len((uint8_t *)hdr) != 0) return;
+  uint8_t flags = get_flags(hdr);
+  uint32_t seq = get_seq(hdr);
+  if (flags == FIN_FLAG_MASK) {
+    if (sock->peer_fin_received) {
+      if (seq == sock->peer_fin_seq && sock->close_state == CLOSE_WAIT_ACK)
+        resend_close_packet(sock);
+      return;
+    }
+    if (seq != sock->window.next_seq_expected) return;
+    sock->peer_fin_received = 1;
+    sock->peer_fin_seq = seq;
+    sock->window.next_seq_expected++;
+    // If our FIN is already outstanding, reuse its sequence number in FIN-ACK.
+    if (sock->close_state == CLOSE_WAIT_FIN_ACK) {
+      sock->simultaneous_close = 1;
+      sock->close_state = CLOSE_WAIT_ACK;
+      resend_close_packet(sock);
+      sock->close_deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+    }
+    // The peer's FIN alone does not request our application's closure.
+  } else if (flags == (FIN_FLAG_MASK | ACK_FLAG_MASK)) {
+    if (get_ack(hdr) != sock->local_fin_seq + 1) return;
+    if (sock->close_state == CLOSE_WAIT_FIN_ACK) {
+      if (seq != sock->window.next_seq_expected) return;
+      sock->peer_fin_received = 1;
+      sock->peer_fin_seq = seq;
+      sock->window.next_seq_expected++;
+      sock->window.last_ack_received = sock->local_fin_seq + 1;
+      sock->close_state = CLOSE_LINGER;
+    } else if (sock->close_state == CLOSE_WAIT_ACK &&
+               sock->simultaneous_close && seq == sock->peer_fin_seq) {
+      // Its FIN was already counted when the crossed FIN arrived.
+      sock->window.last_ack_received = sock->local_fin_seq + 1;
+      sock->close_state = CLOSE_LINGER;
+    } else if (sock->close_state != CLOSE_LINGER ||
+               seq != sock->peer_fin_seq) {
+      return;
+    }
+    send_handshake_packet(sock, ACK_FLAG_MASK, sock->local_fin_seq + 1,
+                          sock->peer_fin_seq + 1);
+    sock->close_deadline = monotonic_ms() + 2LL * DEFAULT_TIMEOUT;
+  }
+}
+
 /**
  * Tells if a given sequence number has been acknowledged by the socket.
  *
@@ -194,6 +257,20 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     return;
   }
 
+  if (flags & FIN_FLAG_MASK) {
+    handle_close_packet(sock, hdr);
+    return;
+  }
+  if (sock->close_state == CLOSE_WAIT_ACK && flags == ACK_FLAG_MASK &&
+      get_payload_len(pkt) == 0 && get_ack(hdr) == sock->local_fin_seq + 1 &&
+      get_seq(hdr) == sock->peer_fin_seq + 1) {
+    sock->window.last_ack_received = sock->local_fin_seq + 1;
+    sock->close_state = sock->simultaneous_close ? CLOSE_LINGER : CLOSE_DONE;
+    if (sock->simultaneous_close)
+      sock->close_deadline = monotonic_ms() + 2LL * DEFAULT_TIMEOUT;
+    return;
+  }
+
   if (flags != 0 && flags != ACK_FLAG_MASK) return;
 
   if (flags & ACK_FLAG_MASK) {
@@ -205,7 +282,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   }
 
   uint16_t payload_len = get_payload_len(pkt);
-  if (payload_len == 0) return;
+  if (payload_len == 0 || sock->peer_fin_received) return;
   if (get_seq(hdr) == sock->window.next_seq_expected) {
     uint8_t *buf = realloc(sock->received_buf,
                             sock->received_len + payload_len);
@@ -444,10 +521,23 @@ void *begin_backend(void *in) {
 
     if (death && buf_len == 0) {
       pthread_mutex_unlock(&sock->send_lock);
-      break;
-    }
-
-    if (buf_len > 0) {
+      if (sock->close_state == CLOSE_OPEN && start_teardown(sock) < 0) {
+        perror("CMU-TCP teardown send");
+        return NULL;
+      }
+      if (sock->close_state == CLOSE_DONE) break;
+      if (monotonic_ms() >= sock->close_deadline) {
+        if (sock->close_state == CLOSE_LINGER) break;
+        if (resend_close_packet(sock) < 0) {
+          perror("CMU-TCP teardown retransmission");
+          return NULL;
+        }
+        sock->close_deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      }
+      struct pollfd fd = {.fd = sock->socket, .events = POLLIN};
+      int64_t remaining = sock->close_deadline - monotonic_ms();
+      if (remaining > 0) poll(&fd, 1, (int)MIN(remaining, 100));
+    } else if (buf_len > 0) {
       data = malloc(buf_len);
       memcpy(data, sock->sending_buf, buf_len);
       sock->sending_len = 0;

@@ -46,6 +46,12 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
 
   sock->type = socket_type;
   sock->dying = 0;
+  sock->close_state = 0;
+  sock->peer_fin_received = 0;
+  sock->simultaneous_close = 0;
+  sock->local_fin_seq = 0;
+  sock->peer_fin_seq = 0;
+  sock->close_deadline = 0;
   pthread_mutex_init(&(sock->death_lock), NULL);
 
   // The backend synchronizes these values during tcp_handshake().

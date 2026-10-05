@@ -12,3 +12,30 @@ Both scenarios passed locally using a Python UDP receiver and the C sender;
 all 6875 payload bytes matched. This exercises sender behavior; the scripted
 receiver is not the C receiver. The complete container test suite was not run.
 Run from project-2_15-441: python3 tests/test_window_scenarios.py
+
+C receiver validation (tests/test_receiver_scenarios.py):
+Compile the real C listener and drive it with a scripted Python UDP initiator.
+Check SYN-ACK, silence after final pure ACK, and supplied payload ACK cases
+("pa" and "pytest 1234567"). Check five in-order MSS-sized packets and the
+same packet-2-loss replay used in the sender tests. Out-of-order packets keep
+the cumulative ACK unchanged; replay fills the gap and completes delivery.
+Read the application stream in 997-byte chunks and compare exact output bytes.
+All four local cases passed. These are finite receiver checks, not exhaustive
+validation or a run of the original container suite. Handshake loss, malformed
+packets, wraparound, and lifecycle behavior are not established by this suite.
+Run from project-2_15-441: python3 tests/test_receiver_scenarios.py
+
+Teardown tests (tests/test_teardown_scenarios.py):
+Two real C endpoints transfer three MSS-sized packets through a UDP relay.
+Verify exact application bytes, FIN after final data ACK, control sequence/ACK
+numbers, and the final linger period. Repeat dropping the first FIN, FIN-ACK,
+or final ACK. Normal closure, FIN-ACK-loss recovery, and final-ACK-loss recovery passed locally.
+Dropping the first FIN originally exposed crossed FINs. After the student
+specified collision handling, this case passed: an endpoint already waiting
+for FIN-ACK responds to FIN with FIN-ACK using its original FIN sequence number.
+Both endpoints can acknowledge FIN-ACK and linger when FINs cross. All four
+teardown scenarios now pass, including first-FIN loss.
+FIN-ACK may be retransmitted in response to a duplicate FIN before its own timer
+expires; the test allows this behavior.
+Earlier scripted window/receiver tests predate teardown and their scripted peers
+still need teardown support before their cmu_close completion can be retested.
