@@ -17,6 +17,7 @@
 
 #include "backend.h"
 
+#include <errno.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,11 +25,136 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "cmu_packet.h"
 #include "cmu_tcp.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+
+static int64_t monotonic_ms(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int same_peer(const struct sockaddr_in *a,
+                     const struct sockaddr_in *b) {
+  return a->sin_addr.s_addr == b->sin_addr.s_addr &&
+         a->sin_port == b->sin_port;
+}
+
+static int send_handshake_packet(cmu_socket_t *sock, uint8_t flags,
+                                 uint32_t seq, uint32_t ack) {
+  uint16_t len = sizeof(cmu_tcp_header_t);
+  uint8_t *pkt = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
+                               seq, ack, len, len, flags, 1, 0, NULL, NULL, 0);
+  if (pkt == NULL) return EXIT_ERROR;
+  ssize_t sent = sendto(sock->socket, pkt, len, 0,
+                        (struct sockaddr *)&sock->conn, sizeof(sock->conn));
+  free(pkt);
+  return sent == len ? EXIT_SUCCESS : EXIT_ERROR;
+}
+
+// Receive one complete UDP datagram. Malformed packets are ignored without
+// changing the retransmission deadline or the socket's saved peer address.
+static int receive_handshake_packet(cmu_socket_t *sock, cmu_tcp_header_t *hdr,
+                                    struct sockaddr_in *peer, int timeout) {
+  struct pollfd fd = {.fd = sock->socket, .events = POLLIN};
+  int ready = poll(&fd, 1, timeout);
+  if (ready < 0) return errno == EINTR ? 0 : EXIT_ERROR;
+  if (ready == 0) return 0;
+  uint8_t buf[MAX_LEN + 1];
+  socklen_t peer_len = sizeof(*peer);
+  ssize_t len = recvfrom(sock->socket, buf, sizeof(buf), MSG_DONTWAIT,
+                         (struct sockaddr *)peer, &peer_len);
+  if (len < 0) {
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+               ? 0 : EXIT_ERROR;
+  }
+  if (len != (ssize_t)sizeof(*hdr)) return 0;
+  memcpy(hdr, buf, sizeof(*hdr));
+  if (ntohl(hdr->identifier) != IDENTIFIER || get_hlen(hdr) != sizeof(*hdr) ||
+      get_plen(hdr) != len || get_extension_length(hdr) != 0 ||
+      get_src(hdr) != ntohs(peer->sin_port) || get_dst(hdr) != sock->my_port) {
+    return 0;
+  }
+  return 1;
+}
+
+// Implements the student's SYN / SYN-ACK / ACK exchange before data sending.
+static int tcp_handshake(cmu_socket_t *sock) {
+  FILE *random = fopen("/dev/urandom", "rb");
+  if (random == NULL) return EXIT_ERROR;
+  size_t count = fread(&sock->local_isn, sizeof(sock->local_isn), 1, random);
+  fclose(random);
+  if (count != 1) return EXIT_ERROR;
+
+  int waiting_for_syn = sock->type == TCP_LISTENER;
+  uint8_t outgoing = SYN_FLAG_MASK;
+  uint32_t outgoing_ack = 0;
+  if (!waiting_for_syn &&
+      send_handshake_packet(sock, outgoing, sock->local_isn, 0) < 0) {
+    return EXIT_ERROR;
+  }
+  int64_t deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+
+  while (1) {
+    pthread_mutex_lock(&sock->death_lock);
+    int dying = sock->dying;
+    pthread_mutex_unlock(&sock->death_lock);
+    if (dying) return EXIT_ERROR;
+
+    int64_t remaining = deadline - monotonic_ms();
+    if (!waiting_for_syn && remaining <= 0) {
+      if (send_handshake_packet(sock, outgoing, sock->local_isn,
+                                outgoing_ack) < 0) return EXIT_ERROR;
+      deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      remaining = DEFAULT_TIMEOUT;
+    }
+    // Short polling intervals also let cmu_close interrupt an unfinished setup.
+    int timeout = waiting_for_syn ? 100 : (int)MIN(remaining, 100);
+    cmu_tcp_header_t hdr;
+    struct sockaddr_in peer;
+    int received = receive_handshake_packet(sock, &hdr, &peer, timeout);
+    if (received < 0) return EXIT_ERROR;
+    if (received == 0) continue;
+
+    uint8_t flags = get_flags(&hdr);
+    if (waiting_for_syn) {
+      if (flags != SYN_FLAG_MASK) continue;
+      sock->conn = peer;
+      sock->peer_isn = get_seq(&hdr);
+      outgoing = SYN_FLAG_MASK | ACK_FLAG_MASK;
+      outgoing_ack = sock->peer_isn + 1;
+      if (send_handshake_packet(sock, outgoing, sock->local_isn,
+                                outgoing_ack) < 0) return EXIT_ERROR;
+      waiting_for_syn = 0;
+      deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      continue;
+    }
+    if (!same_peer(&peer, &sock->conn)) continue;
+
+    if (sock->type == TCP_INITIATOR) {
+      if (flags != (SYN_FLAG_MASK | ACK_FLAG_MASK) ||
+          get_ack(&hdr) != sock->local_isn + 1) continue;
+      sock->peer_isn = get_seq(&hdr);
+      if (send_handshake_packet(sock, ACK_FLAG_MASK, sock->local_isn + 1,
+                                sock->peer_isn + 1) < 0) return EXIT_ERROR;
+    } else {
+      if (flags == SYN_FLAG_MASK && get_seq(&hdr) == sock->peer_isn) {
+        if (send_handshake_packet(sock, outgoing, sock->local_isn,
+                                  outgoing_ack) < 0) return EXIT_ERROR;
+        continue;
+      }
+      if (flags != ACK_FLAG_MASK || get_ack(&hdr) != sock->local_isn + 1 ||
+          get_seq(&hdr) != sock->peer_isn + 1) continue;
+    }
+    sock->window.last_ack_received = sock->local_isn + 1;
+    sock->window.next_seq_expected = sock->peer_isn + 1;
+    return EXIT_SUCCESS;
+  }
+}
 
 /**
  * Tells if a given sequence number has been acknowledged by the socket.
@@ -56,6 +182,17 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
 void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
+
+  if (flags & SYN_FLAG_MASK) {
+    if (sock->type == TCP_INITIATOR &&
+        flags == (SYN_FLAG_MASK | ACK_FLAG_MASK) &&
+        get_seq(hdr) == sock->peer_isn &&
+        get_ack(hdr) == sock->local_isn + 1) {
+      send_handshake_packet(sock, ACK_FLAG_MASK, sock->local_isn + 1,
+                            sock->peer_isn + 1);
+    }
+    return;
+  }
 
   switch (flags) {
     case ACK_FLAG_MASK: {
@@ -112,56 +249,41 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
 /**
  * Checks if the socket received any data.
  *
- * It first peeks at the header to figure out the length of the packet and then
- * reads the entire packet.
+ * Reads and validates one complete UDP datagram from the established peer.
  *
  * @param sock The socket used for receiving data on the connection.
  * @param flags Flags that determine how the socket should wait for data. Check
  *             `cmu_read_mode_t` for more information.
  */
 void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
-  cmu_tcp_header_t hdr;
-  uint8_t *pkt;
-  socklen_t conn_len = sizeof(sock->conn);
-  ssize_t len = 0;
-  uint32_t plen = 0, buf_size = 0, n = 0;
+  uint8_t pkt[MAX_LEN + 1];
+  struct sockaddr_in peer;
+  socklen_t conn_len = sizeof(peer);
+  int recv_flags = MSG_DONTWAIT;
 
-  while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+  if (flags == TIMEOUT) {
+    struct pollfd fd = {.fd = sock->socket, .events = POLLIN};
+    if (poll(&fd, 1, DEFAULT_TIMEOUT) <= 0) return;
+  } else if (flags == NO_FLAG) {
+    recv_flags = 0;
+  } else if (flags != NO_WAIT) {
+    fprintf(stderr, "ERROR unknown flag\n");
+    return;
   }
-  switch (flags) {
-    case NO_FLAG:
-      len = recvfrom(sock->socket, &hdr, sizeof(cmu_tcp_header_t), MSG_PEEK,
-                     (struct sockaddr *)&(sock->conn), &conn_len);
-      break;
-    case TIMEOUT: {
-      // Using `poll` here so that we can specify a timeout.
-      struct pollfd ack_fd;
-      ack_fd.fd = sock->socket;
-      ack_fd.events = POLLIN;
-      // Timeout after DEFAULT_TIMEOUT.
-      if (poll(&ack_fd, 1, DEFAULT_TIMEOUT) <= 0) {
-        break;
-      }
+
+  pthread_mutex_lock(&sock->recv_lock);
+  ssize_t len = recvfrom(sock->socket, pkt, sizeof(pkt), recv_flags,
+                         (struct sockaddr *)&peer, &conn_len);
+  if (len >= (ssize_t)sizeof(cmu_tcp_header_t) && len <= MAX_LEN &&
+      same_peer(&peer, &sock->conn)) {
+    cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
+    uint16_t hlen = get_hlen(hdr);
+    if (ntohl(hdr->identifier) == IDENTIFIER && get_plen(hdr) == len &&
+        hlen >= sizeof(*hdr) && hlen <= len &&
+        get_extension_length(hdr) == hlen - sizeof(*hdr) &&
+        get_src(hdr) == ntohs(peer.sin_port) && get_dst(hdr) == sock->my_port) {
+      handle_message(sock, pkt);
     }
-    // Fallthrough.
-    case NO_WAIT:
-      len = recvfrom(sock->socket, &hdr, sizeof(cmu_tcp_header_t),
-                     MSG_DONTWAIT | MSG_PEEK, (struct sockaddr *)&(sock->conn),
-                     &conn_len);
-      break;
-    default:
-      perror("ERROR unknown flag");
-  }
-  if (len >= (ssize_t)sizeof(cmu_tcp_header_t)) {
-    plen = get_plen(&hdr);
-    pkt = malloc(plen);
-    while (buf_size < plen) {
-      n = recvfrom(sock->socket, pkt + buf_size, plen - buf_size, 0,
-                   (struct sockaddr *)&(sock->conn), &conn_len);
-      buf_size = buf_size + n;
-    }
-    handle_message(sock, pkt);
-    free(pkt);
   }
   pthread_mutex_unlock(&(sock->recv_lock));
 }
@@ -221,6 +343,11 @@ void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   int death, buf_len, send_signal;
   uint8_t *data;
+
+  if (tcp_handshake(sock) < 0) {
+    fprintf(stderr, "CMU-TCP handshake failed or was interrupted\n");
+    return NULL;
+  }
 
   while (1) {
     while (pthread_mutex_lock(&(sock->death_lock)) != 0) {

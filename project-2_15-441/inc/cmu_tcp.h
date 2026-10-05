@@ -60,6 +60,9 @@ typedef struct {
   int dying;
   pthread_mutex_t death_lock;
   window_t window;
+  // Retained so the backend can recognize a retransmitted SYN-ACK.
+  uint32_t local_isn;
+  uint32_t peer_isn;
 } cmu_socket_t;
 
 /*
