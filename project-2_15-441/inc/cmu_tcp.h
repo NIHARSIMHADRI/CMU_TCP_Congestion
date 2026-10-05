@@ -30,6 +30,7 @@
 typedef struct {
   uint32_t next_seq_expected;
   uint32_t last_ack_received;
+  uint32_t next_seq_to_send;
 } window_t;
 
 /**

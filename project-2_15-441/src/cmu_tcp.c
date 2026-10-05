@@ -50,6 +50,7 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
 
   // The backend synchronizes these values during tcp_handshake().
   sock->window.last_ack_received = 0;
+  sock->window.next_seq_to_send = 0;
   sock->window.next_seq_expected = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {

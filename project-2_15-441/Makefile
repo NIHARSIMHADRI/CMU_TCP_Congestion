@@ -26,6 +26,7 @@ format:
 test: all
 	sudo -E python3 tests/test_cp1.py
 	sudo -E python3 tests/test_cp1_basic_ack_packets.py
+	python3 tests/test_window_scenarios.py
 
 clean:
 	rm -f $(BUILD_DIR)/*.o peer client server

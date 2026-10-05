@@ -1,1 +1,14 @@
 Describe your tests here
+
+Window and Go-Back-N scenarios (tests/test_window_scenarios.py):
+Build an isolated copy with CP1_WINDOW_SIZE = MSS * 3; leave grading.h unchanged.
+Queue five MSS-sized packets. Hold ACKs until three packets arrive and verify
+no fourth packet arrives before window space is released. A cumulative ACK for
+the first two packets permits packets four and five. Check exact payload bytes.
+Repeat while dropping packet two and discarding out-of-order packets: packet one
+is acknowledged, packet four fills its freed slot, then the timeout causes
+Go-Back-N retransmission of packets two, three, and four before packet five.
+Both scenarios passed locally using a Python UDP receiver and the C sender;
+all 6875 payload bytes matched. This exercises sender behavior; the scripted
+receiver is not the C receiver. The complete container test suite was not run.
+Run from project-2_15-441: python3 tests/test_window_scenarios.py

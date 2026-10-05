@@ -150,6 +150,7 @@ static int tcp_handshake(cmu_socket_t *sock) {
       if (flags != ACK_FLAG_MASK || get_ack(&hdr) != sock->local_isn + 1 ||
           get_seq(&hdr) != sock->peer_isn + 1) continue;
     }
+    sock->window.next_seq_to_send = sock->local_isn + 1;
     sock->window.last_ack_received = sock->local_isn + 1;
     sock->window.next_seq_expected = sock->peer_isn + 1;
     return EXIT_SUCCESS;
@@ -173,8 +174,7 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
 /**
  * Updates the socket information to represent the newly received packet.
  *
- * In the current stop-and-wait implementation, this function also sends an
- * acknowledgement for the packet.
+ * Processes cumulative ACKs and acknowledges only contiguous received data.
  *
  * @param sock The socket used for handling packets received.
  * @param pkt The packet data received by the socket.
@@ -194,56 +194,35 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     return;
   }
 
-  switch (flags) {
-    case ACK_FLAG_MASK: {
-      uint32_t ack = get_ack(hdr);
-      if (after(ack, sock->window.last_ack_received)) {
-        sock->window.last_ack_received = ack;
-      }
-      break;
-    }
-    default: {
-      socklen_t conn_len = sizeof(sock->conn);
-      uint32_t seq = sock->window.last_ack_received;
+  if (flags != 0 && flags != ACK_FLAG_MASK) return;
 
-      // No payload.
-      uint8_t *payload = NULL;
-      uint16_t payload_len = 0;
-
-      // No extension.
-      uint16_t ext_len = 0;
-      uint8_t *ext_data = NULL;
-
-      uint16_t src = sock->my_port;
-      uint16_t dst = ntohs(sock->conn.sin_port);
-      uint32_t ack = get_seq(hdr) + get_payload_len(pkt);
-      uint16_t hlen = sizeof(cmu_tcp_header_t);
-      uint16_t plen = hlen + payload_len;
-      uint8_t flags = ACK_FLAG_MASK;
-      uint16_t adv_window = 1;
-      uint8_t *response_packet =
-          create_packet(src, dst, seq, ack, hlen, plen, flags, adv_window,
-                        ext_len, ext_data, payload, payload_len);
-
-      sendto(sock->socket, response_packet, plen, 0,
-             (struct sockaddr *)&(sock->conn), conn_len);
-      free(response_packet);
-
-      seq = get_seq(hdr);
-
-      if (seq == sock->window.next_seq_expected) {
-        sock->window.next_seq_expected = seq + get_payload_len(pkt);
-        payload_len = get_payload_len(pkt);
-        payload = get_payload(pkt);
-
-        // Make sure there is enough space in the buffer to store the payload.
-        sock->received_buf =
-            realloc(sock->received_buf, sock->received_len + payload_len);
-        memcpy(sock->received_buf + sock->received_len, payload, payload_len);
-        sock->received_len += payload_len;
-      }
+  if (flags & ACK_FLAG_MASK) {
+    uint32_t ack = get_ack(hdr);
+    if (after(ack, sock->window.last_ack_received) &&
+        !after(ack, sock->window.next_seq_to_send)) {
+      sock->window.last_ack_received = ack;
     }
   }
+
+  uint16_t payload_len = get_payload_len(pkt);
+  if (payload_len == 0) return;
+  if (get_seq(hdr) == sock->window.next_seq_expected) {
+    uint8_t *buf = realloc(sock->received_buf,
+                            sock->received_len + payload_len);
+    if (buf == NULL) {
+      perror("CMU-TCP receive allocation");
+      return;
+    }
+    sock->received_buf = buf;
+    memcpy(buf + sock->received_len, get_payload(pkt), payload_len);
+    sock->received_len += payload_len;
+    sock->window.next_seq_expected += payload_len;
+    // Wake the application even while our sender is waiting for its own ACKs.
+    pthread_cond_signal(&sock->wait_cond);
+  }
+  // Out-of-order and duplicate data are discarded; ACK the contiguous prefix.
+  send_handshake_packet(sock, ACK_FLAG_MASK, sock->window.next_seq_to_send,
+                        sock->window.next_seq_expected);
 }
 
 /**
@@ -288,15 +267,7 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
   pthread_mutex_unlock(&(sock->recv_lock));
 }
 
-/**
- * Breaks up the data into packets and sends a single packet at a time.
- *
- * You should most certainly update this function in your implementation.
- *
- * @param sock The socket to use for sending data.
- * @param data The data to be sent.
- * @param buf_len The length of the data being sent.
- */
+// Retained stop-and-wait alternative; begin_backend uses window_send().
 void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
   uint8_t *msg;
   uint8_t *data_offset = data;
@@ -322,6 +293,7 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       msg = create_packet(src, dst, seq, ack, hlen, plen, flags, adv_window,
                           ext_len, ext_data, payload, payload_len);
       buf_len -= payload_len;
+      sock->window.next_seq_to_send = seq + payload_len;
 
       while (1) {
         // FIXME: This is using stop and wait, can we do better?
@@ -337,6 +309,117 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       data_offset += payload_len;
     }
   }
+}
+
+// Queue entries retain outstanding payloads in the backend's current data buffer.
+// Entries are released (or trimmed) as cumulative ACKs cover their bytes.
+typedef struct outstanding_packet {
+  uint32_t seq;
+  uint16_t len;
+  uint8_t *payload;
+  struct outstanding_packet *next;
+} outstanding_packet_t;
+
+static int send_data_packet(cmu_socket_t *sock, outstanding_packet_t *entry) {
+  uint16_t hlen = sizeof(cmu_tcp_header_t);
+  uint16_t plen = hlen + entry->len;
+  uint8_t *pkt = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
+                               entry->seq, sock->window.next_seq_expected,
+                               hlen, plen, ACK_FLAG_MASK, 1, 0, NULL,
+                               entry->payload, entry->len);
+  if (pkt == NULL) return EXIT_ERROR;
+  ssize_t sent = sendto(sock->socket, pkt, plen, 0,
+                        (struct sockaddr *)&sock->conn, sizeof(sock->conn));
+  free(pkt);
+  return sent == plen ? EXIT_SUCCESS : EXIT_ERROR;
+}
+
+static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
+  outstanding_packet_t *head = NULL, *tail = NULL;
+  int offset = 0;
+  int64_t deadline = 0;
+  int result = EXIT_SUCCESS;
+
+  while (offset < buf_len || head != NULL) {
+    uint32_t ack = sock->window.last_ack_received;
+    while (head != NULL && !after(head->seq + head->len, ack)) {
+      outstanding_packet_t *done = head;
+      head = head->next;
+      free(done);
+    }
+    if (head == NULL) {
+      tail = NULL;
+      deadline = 0;
+    } else if (after(ack, head->seq)) {
+      uint32_t covered = ack - head->seq;
+      head->seq = ack;
+      head->payload += covered;
+      head->len -= covered;
+    }
+
+    // Timeout recovery uses the same outstanding queue, in sequence order.
+    if (head != NULL && monotonic_ms() >= deadline) {
+      for (outstanding_packet_t *entry = head; entry; entry = entry->next) {
+        if (send_data_packet(sock, entry) < 0) {
+          result = EXIT_ERROR;
+          goto cleanup;
+        }
+      }
+      deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+    }
+
+    while (offset < buf_len) {
+      uint16_t len = MIN((uint32_t)(buf_len - offset), (uint32_t)MSS);
+      uint32_t outstanding = sock->window.next_seq_to_send -
+                             sock->window.last_ack_received;
+      // Preserve the student's rule: do not shrink a packet to fill a gap.
+      if (outstanding > CP1_WINDOW_SIZE ||
+          len > CP1_WINDOW_SIZE - outstanding) break;
+      outstanding_packet_t *entry = malloc(sizeof(*entry));
+      if (entry == NULL) {
+        result = EXIT_ERROR;
+        goto cleanup;
+      }
+      entry->seq = sock->window.next_seq_to_send;
+      entry->len = len;
+      entry->payload = data + offset;
+      entry->next = NULL;
+      if (send_data_packet(sock, entry) < 0) {
+        free(entry);
+        result = EXIT_ERROR;
+        goto cleanup;
+      }
+      if (tail != NULL) tail->next = entry;
+      else {
+        head = entry;
+        deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      }
+      tail = entry;
+      sock->window.next_seq_to_send += len;
+      offset += len;
+    }
+
+    if (head != NULL) {
+      int64_t remaining = deadline - monotonic_ms();
+      struct pollfd fd = {.fd = sock->socket, .events = POLLIN};
+      if (remaining > 0) {
+        int ready = poll(&fd, 1, (int)remaining);
+        if (ready < 0 && errno != EINTR) {
+          result = EXIT_ERROR;
+          goto cleanup;
+        }
+        if (ready > 0) check_for_data(sock, NO_WAIT);
+      }
+    }
+  }
+
+cleanup:
+  while (head != NULL) {
+    outstanding_packet_t *next = head->next;
+    free(head);
+    head = next;
+  }
+  return result;
 }
 
 void *begin_backend(void *in) {
@@ -360,6 +443,7 @@ void *begin_backend(void *in) {
     buf_len = sock->sending_len;
 
     if (death && buf_len == 0) {
+      pthread_mutex_unlock(&sock->send_lock);
       break;
     }
 
@@ -370,8 +454,12 @@ void *begin_backend(void *in) {
       free(sock->sending_buf);
       sock->sending_buf = NULL;
       pthread_mutex_unlock(&(sock->send_lock));
-      single_send(sock, data, buf_len);
+      int sent = window_send(sock, data, buf_len);
       free(data);
+      if (sent < 0) {
+        perror("CMU-TCP window send");
+        return NULL;
+      }
     } else {
       pthread_mutex_unlock(&(sock->send_lock));
     }
