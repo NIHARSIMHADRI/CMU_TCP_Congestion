@@ -155,11 +155,10 @@ enum { CLOSE_OPEN, CLOSE_WAIT_FIN_ACK, CLOSE_WAIT_ACK, CLOSE_LINGER,
        CLOSE_DONE };
 
 static int resend_close_packet(cmu_socket_t *sock) {
-  uint8_t flags = sock->close_state == CLOSE_WAIT_ACK
-                      ? FIN_FLAG_MASK | ACK_FLAG_MASK : FIN_FLAG_MASK;
-  uint32_t ack = sock->close_state == CLOSE_WAIT_ACK
-                     ? sock->peer_fin_seq + 1 : 0;
-  return send_handshake_packet(sock, flags, sock->local_fin_seq, ack);
+  // Every FIN acknowledges the contiguous prefix of the peer's stream.
+  return send_handshake_packet(sock, FIN_FLAG_MASK | ACK_FLAG_MASK,
+                               sock->local_fin_seq,
+                               sock->window.next_seq_expected);
 }
 
 // Called only after window_send has received ACKs for all outgoing data.
@@ -177,7 +176,19 @@ static void handle_close_packet(cmu_socket_t *sock, cmu_tcp_header_t *hdr) {
   if (get_payload_len((uint8_t *)hdr) != 0) return;
   uint8_t flags = get_flags(hdr);
   uint32_t seq = get_seq(hdr);
-  if (flags == FIN_FLAG_MASK) {
+  if (flags != FIN_FLAG_MASK && flags != (FIN_FLAG_MASK | ACK_FLAG_MASK))
+    return;
+  if (flags & ACK_FLAG_MASK) {
+    uint32_t ack = get_ack(hdr);
+    if (after(ack, sock->window.next_seq_to_send)) return;
+    if (after(ack, sock->window.last_ack_received))
+      sock->window.last_ack_received = ack;
+  }
+  // FIN+ACK is an initial/crossed FIN unless it acknowledges our own FIN.
+  int acknowledges_fin = flags == (FIN_FLAG_MASK | ACK_FLAG_MASK) &&
+                         sock->close_state != CLOSE_OPEN &&
+                         get_ack(hdr) == sock->local_fin_seq + 1;
+  if (!acknowledges_fin) {
     if (sock->peer_fin_received) {
       if (seq == sock->peer_fin_seq && sock->close_state == CLOSE_WAIT_ACK)
         resend_close_packet(sock);
