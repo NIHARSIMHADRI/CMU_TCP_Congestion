@@ -75,8 +75,7 @@ static int receive_handshake_packet(cmu_socket_t *sock, cmu_tcp_header_t *hdr,
   if (len != (ssize_t)sizeof(*hdr)) return 0;
   memcpy(hdr, buf, sizeof(*hdr));
   if (ntohl(hdr->identifier) != IDENTIFIER || get_hlen(hdr) != sizeof(*hdr) ||
-      get_plen(hdr) != len || get_extension_length(hdr) != 0 ||
-      get_src(hdr) != ntohs(peer->sin_port) || get_dst(hdr) != sock->my_port) {
+      get_plen(hdr) != len || get_extension_length(hdr) != 0) {
     return 0;
   }
   return 1;
