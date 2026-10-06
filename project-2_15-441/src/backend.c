@@ -335,8 +335,7 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
     uint16_t hlen = get_hlen(hdr);
     if (ntohl(hdr->identifier) == IDENTIFIER && get_plen(hdr) == len &&
         hlen >= sizeof(*hdr) && hlen <= len &&
-        get_extension_length(hdr) == hlen - sizeof(*hdr) &&
-        get_src(hdr) == ntohs(peer.sin_port) && get_dst(hdr) == sock->my_port) {
+        get_extension_length(hdr) == hlen - sizeof(*hdr)) {
       handle_message(sock, pkt);
     }
   }
