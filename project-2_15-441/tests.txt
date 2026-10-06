@@ -39,3 +39,9 @@ FIN-ACK may be retransmitted in response to a duplicate FIN before its own timer
 expires; the test allows this behavior.
 Earlier scripted window/receiver tests predate teardown and their scripted peers
 still need teardown support before their cmu_close completion can be retested.
+
+Wireshark demo: tests/wireshark_demo.c sends three MSS-sized packets from
+client to server, compares all bytes, and requests teardown. Build with make.
+Run tests/wireshark_demo server on server and tests/wireshark_demo client on
+client, capturing with utils/capture_packets.sh. This produces a real C-to-C
+exchange for manual Wireshark inspection.
