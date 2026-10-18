@@ -45,3 +45,98 @@ client to server, compares all bytes, and requests teardown. Build with make.
 Run tests/wireshark_demo server on server and tests/wireshark_demo client on
 client, capturing with utils/capture_packets.sh. This produces a real C-to-C
 exchange for manual Wireshark inspection.
+
+=== Checkpoint 2 ===
+
+Instrumentation (src/backend.c, log_cwnd):
+Setting CMU_TCP_CWND_LOG to a path makes the sender append a CSV row
+(time_ms, cwnd, ssthresh, adv_window, stage) on every congestion-control
+transition. Stage labels are init, slow_start, congestion_avoidance,
+fast_retransmit, recovery_inflate, recovery_exit, and timeout. This is the
+data source for the cwnd-over-time plots and was also the main debugging tool
+for the checkpoint, since it makes every state change visible.
+
+Transfer harness (tests/cwnd_probe.c, tests/cwnd_run.sh):
+cwnd_probe sends or receives a fixed byte count over loopback and verifies the
+received bytes against the generated pattern, reporting CORRECT or CORRUPT.
+cwnd_run.sh runs a transfer with cwnd logging enabled and summarises stage
+counts and cwnd/ssthresh ranges. Used for bulk transfers (400KB) to confirm
+end-to-end correctness and to collect sawtooth data.
+
+Congestion control under deterministic loss (tests/test_cp2_loss.py):
+A UDP relay forwards between two real C endpoints and drops chosen data
+packets, so specific TCP Reno transitions are forced rather than hoped for.
+Scenario A drops one mid-stream packet once, with enough packets behind it to
+generate three duplicate ACKs; this exercises fast retransmit, window
+inflation, and recovery exit. Scenario B drops the same packet six times so
+duplicates can never resolve it, forcing the retransmission timeout path and
+repeated ssthresh reduction. Scenario C drops two distinct packets in the same
+window. All three verify exact payload bytes and assert that the expected
+stages appear in the cwnd log.
+Scenario C originally reported CORRUPT. The receiver advanced
+next_seq_expected straight to last_byte_rcvd when a gap was filled, which
+declared the second gap's bytes received, delivered uninitialised buffer
+contents to the application, and ACKed data the sender then discarded, losing
+it permanently. The receiver now advances only over bytes a packet actually
+delivered. The cost is that buffered out-of-order data is no longer absorbed
+in bulk, so one loss can produce several ssthresh reductions.
+All three scenarios pass, each delivering 200000 bytes in 146 packets, which
+is the minimum for that byte count.
+
+Per-round flight measurement (tests/dbg_flight.py):
+Acts as a receiver holding the advertised window open, withholds ACKs to
+delimit a round, then releases one ACK per packet so slow start sees as many
+ACKs as it sent packets. Reports flight size per round, the ratio to the
+previous round, MSS alignment, and whether any retransmission was seen.
+This found a retransmission-timer bug: the timer was armed only when the
+outstanding queue went from empty to non-empty, which a sender keeping its
+window full never does, so any transfer lasting past DEFAULT_TIMEOUT took a
+phantom timeout that halved ssthresh mid-transfer. The timer is now restarted
+by any ACK that advances last_ack_received. Before the fix a 200KB transfer
+took 241 to 313 packets; after, it takes 146.
+The same harness showed that partial segments sent to fill a sub-MSS window
+remainder made flight sizes non-MSS-aligned. Segments are full MSS again; the
+receiver-side window announcement is what prevents a small window stalling
+the sender.
+With ssthresh lowered to MSS*16 so it is reachable below the 65535-byte
+advertised-window ceiling, flights grow 1375, 2750, 5500, 11000, 22000 and
+then increase by exactly 1375 per flight, confirming exponential slow start
+and one-MSS-per-RTT congestion avoidance.
+
+Duplicate-ACK response (tests/dbg_dupresponse.py):
+Grows cwnd with honest ACKs, then sends N duplicate ACKs and reports cwnd
+before loss, at fast retransmit, and after inflation. Run with N = 3, 10, 31.
+This found that folding the fast-recovery inflation into cwnd inverted
+multiplicative decrease: a single loss in a 32-packet window produces 31
+duplicate ACKs, and at a pre-loss cwnd of 44000 the inflation left cwnd at
+64625, higher than before the loss. The inflation is now tracked separately
+in window.recovery_inflation and added only to the sending window, so cwnd
+stays at the halved value (22000) regardless of duplicate count.
+
+Timeout response (tests/dbg_timeout.py):
+Grows cwnd, goes silent longer than DEFAULT_TIMEOUT to force a timeout, then
+resumes ACKing and reports the flight sizes and the cwnd log around the event.
+This found that the timeout path set cwnd to one MSS and then immediately
+retransmitted the entire outstanding queue, so the first flight after a
+timeout was 32 packets rather than one. Retransmitting only the head instead
+made recovery cost one timeout per lost packet and the loss suite stopped
+completing. The timeout path now rewinds next_seq_to_send to
+last_ack_received and discards the queue, letting the normal cwnd-bounded
+send path retransmit: one packet immediately, doubling as ACKs arrive.
+Post-timeout flights are now 1375 then 2750.
+
+Known limitations:
+Two timeouts during one outage drive ssthresh to its 2*MSS floor, because
+ssthresh = cwnd/2 is recomputed from a cwnd that has already been reset to one
+MSS rather than from the window size at which congestion occurred. Slow start
+then gets a single doubling before congestion avoidance takes over. A single
+timeout behaves correctly.
+WINDOW_INITIAL_SSTHRESH is MSS*64 = 88000 but the advertised window field is
+16 bits, capped at 65535, so with the shipped grading.h values ssthresh is
+unreachable whenever flow control binds first and congestion avoidance cannot
+be observed.
+The receiver tracks only one out-of-order region, so a second simultaneous
+gap is buffered but not absorbed; correctness is preserved but recovery costs
+extra round trips.
+All measurements above were taken over Docker loopback. The experimental
+component still needs to be run on separate AWS instances.

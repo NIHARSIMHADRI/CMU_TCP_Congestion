@@ -94,6 +94,7 @@ static void cc_on_ack(cmu_socket_t *sock, int advanced) {
     sock->window.dup_ack_count = 0;
     if (sock->window.in_fast_recovery) {
       sock->window.in_fast_recovery = 0;
+      sock->window.recovery_inflation = 0;
       sock->window.cwnd = sock->window.ssthresh;
       log_cwnd(sock, "recovery_exit");
       return;
@@ -113,9 +114,10 @@ static void cc_on_ack(cmu_socket_t *sock, int advanced) {
   }
 
   if (sock->window.in_fast_recovery) {
-    // Each duplicate means one more packet has drained out of the network,
-    // so one more packet's worth of data may be put in flight.
-    sock->window.cwnd += MSS;
+    // Each duplicate means one more packet has drained out of the network, so
+    // one more packet's worth may go in flight. This is a sending allowance
+    // only -- cwnd itself must stay at the reduced capacity estimate.
+    sock->window.recovery_inflation += MSS;
     log_cwnd(sock, "recovery_inflate");
     return;
   }
@@ -123,7 +125,10 @@ static void cc_on_ack(cmu_socket_t *sock, int advanced) {
   sock->window.dup_ack_count++;
   if (sock->window.dup_ack_count == 3) {
     sock->window.ssthresh = halved_ssthresh(sock->window.cwnd);
-    sock->window.cwnd = sock->window.ssthresh + 3 * MSS;
+    sock->window.cwnd = sock->window.ssthresh;
+    // The three duplicates themselves account for three packets that have
+    // already left the network.
+    sock->window.recovery_inflation = 3 * MSS;
     sock->window.in_fast_recovery = 1;
     sock->window.fast_retransmit_pending = 1;
     log_cwnd(sock, "fast_retransmit");
@@ -609,9 +614,13 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
   int result = EXIT_SUCCESS;
 
 
+  uint32_t last_seen_ack = sock->window.last_ack_received;
+
   // MOVE THROUGH THE DATA IN THE BUFFER.
   while (offset < buf_len || head != NULL) {
     uint32_t ack = sock->window.last_ack_received;
+    int ack_advanced = after(ack, last_seen_ack);
+    if (ack_advanced) last_seen_ack = ack;
 
     // Move the head to the data that has not been yet acked 
     // and free the other data from the buffer it has been processed
@@ -625,12 +634,21 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
     if (head == NULL) {
       tail = NULL;
       deadline = 0;
-    } 
-    else if (after(ack, head->seq)) {
-      uint32_t covered = ack - head->seq;
-      head->seq = ack;
-      head->payload += covered;
-      head->len -= covered;
+    } else {
+      if (after(ack, head->seq)) {
+        uint32_t covered = ack - head->seq;
+        head->seq = ack;
+        head->payload += covered;
+        head->len -= covered;
+      }
+      // Restart the retransmission timer on forward progress. The timer has
+      // to measure silence from the peer; previously it was only armed when
+      // the queue went from empty to non-empty, so a sender keeping its
+      // window full -- the normal, healthy case -- never rearmed it and took
+      // a phantom timeout on every transfer lasting past DEFAULT_TIMEOUT.
+      if (ack_advanced) {
+        deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      }
     }
 
     // CP2 fast retransmit: three duplicate ACKs pinpointed the hole at the
@@ -656,16 +674,28 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       sock->window.ssthresh = halved_ssthresh(sock->window.cwnd);
       sock->window.cwnd = WINDOW_INITIAL_WINDOW_SIZE;
       sock->window.in_fast_recovery = 0;
+      sock->window.recovery_inflation = 0;
       sock->window.dup_ack_count = 0;
       log_cwnd(sock, "timeout");
-        // go back N logic
-      for (outstanding_packet_t *entry = head; entry; entry = entry->next) {
-        if (send_data_packet(sock, entry) < 0) {
-          result = EXIT_ERROR;
-          goto cleanup;
-        }
+
+      // Rewind to the first unacknowledged byte and discard the outstanding
+      // queue. The normal send path below then retransmits from there under
+      // the new cwnd, so the missing segment goes out first and on its own
+      // (cwnd is one MSS), with the rest following as ACKs grow the window.
+      // Resending the whole queue here would contradict the cwnd just set;
+      // resending only the head and waiting for the timer again would cost
+      // one full timeout per lost packet.
+      uint32_t unacked =
+          sock->window.next_seq_to_send - sock->window.last_ack_received;
+      offset -= (int)unacked;
+      sock->window.next_seq_to_send = sock->window.last_ack_received;
+      while (head != NULL) {
+        outstanding_packet_t *next = head->next;
+        free(head);
+        head = next;
       }
-      deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      tail = NULL;
+      deadline = 0;
     }
 
 
@@ -675,20 +705,19 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       uint32_t outstanding = sock->window.next_seq_to_send -
                              sock->window.last_ack_received;
       // CP2: bounded by both the peer's receive capacity and the congestion
-      // window, per the handout's min(advertised window, cwnd).
-      uint32_t send_window = MIN((uint32_t)sock->window.peer_adv_window,
-                                 sock->window.cwnd);
-      if (outstanding >= send_window) break;
-      uint32_t room = send_window - outstanding;
-
-      // CP2: clamp the segment to the space actually on offer rather than
-      // insisting on a full MSS. MAX_NETWORK_BUFFER is not a multiple of MSS
-      // (65535 = 47*1375 + 910), so a full receive buffer always leaves a
-      // sub-MSS remainder; refusing to use it stalls the sender outright.
-      uint16_t len = (uint16_t)MIN(MIN((uint32_t)(buf_len - offset),
-                                       (uint32_t)MSS),
-                                   room);
-      if (len == 0) break;
+      // window, per the handout's min(advertised window, cwnd). During fast
+      // recovery the congestion window is temporarily extended by the
+      // inflation allowance; see window_t.recovery_inflation.
+      uint32_t send_window =
+          MIN((uint32_t)sock->window.peer_adv_window,
+              sock->window.cwnd + sock->window.recovery_inflation);
+      // Only send full-MSS segments (or the final short piece of the buffer).
+      // Partial segments were tried to use a sub-MSS window remainder, but
+      // they make flight sizes non-MSS-aligned; the receiver-side window
+      // announcement in cmu_read() is what keeps a small window from
+      // stalling the sender, so shrinking segments is not needed.
+      uint16_t len = MIN((uint32_t)(buf_len - offset), (uint32_t)MSS);
+      if (outstanding > send_window || len > send_window - outstanding) break;
       outstanding_packet_t *entry = malloc(sizeof(*entry));
       if (entry == NULL) {
         result = EXIT_ERROR;

@@ -68,6 +68,7 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.peer_adv_window = MSS;
   sock->window.dup_ack_count = 0;
   sock->window.in_fast_recovery = 0;
+  sock->window.recovery_inflation = 0;
   sock->window.fast_retransmit_pending = 0;
   sock->window.last_adv_sent = MAX_NETWORK_BUFFER;
   sock->window.window_update_pending = 0;

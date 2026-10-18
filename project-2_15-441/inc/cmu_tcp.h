@@ -48,9 +48,14 @@ typedef struct {
   // Consecutive ACKs received carrying the same (non-advancing) ack number.
   uint32_t dup_ack_count;
   // Set while in fast recovery. Slow start vs. congestion avoidance is
-  // derived from cwnd < ssthresh, but recovery needs its own marker because
-  // cwnd is deliberately inflated above ssthresh while recovering.
+  // derived from cwnd < ssthresh, so recovery needs its own marker.
   int in_fast_recovery;
+  // Temporary extra sending allowance during fast recovery: 3 * MSS on entry
+  // plus one MSS per further duplicate ACK, since each duplicate means one
+  // more packet drained out of the network. Kept separate from cwnd so cwnd
+  // stays a pure capacity estimate -- folding it in made a single loss leave
+  // cwnd above its pre-loss value, inverting multiplicative decrease.
+  uint32_t recovery_inflation;
   // Raised by the ACK handler when three duplicates have been counted, and
   // consumed by window_send(), which owns the outstanding-packet queue.
   int fast_retransmit_pending;
