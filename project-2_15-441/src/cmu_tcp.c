@@ -36,8 +36,11 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
     return EXIT_ERROR;
   }
   sock->socket = sockfd;
-  sock->received_buf = NULL;
-  sock->received_len = 0;
+  sock->received_buf = malloc(MAX_NETWORK_BUFFER);
+  if (sock->received_buf == NULL) {
+    perror("ERROR allocating receive buffer");
+    return EXIT_ERROR;
+  }
   pthread_mutex_init(&(sock->recv_lock), NULL);
 
   sock->sending_buf = NULL;
@@ -58,6 +61,14 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.last_ack_received = 0;
   sock->window.next_seq_to_send = 0;
   sock->window.next_seq_expected = 0;
+  sock->window.last_byte_rcvd = 0;
+  sock->window.last_byte_read = 0;
+  sock->window.cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->window.ssthresh = WINDOW_INITIAL_SSTHRESH;
+  sock->window.peer_adv_window = MSS;
+  sock->window.dup_ack_count = 0;
+  sock->window.in_fast_recovery = 0;
+  sock->window.fast_retransmit_pending = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
@@ -135,8 +146,20 @@ int cmu_close(cmu_socket_t *sock) {
   return close(sock->socket);
 }
 
+// End of the byte range the application is allowed to read. A byte must be
+// both contiguous (before next_seq_expected) and actual payload (before
+// last_byte_rcvd). The two differ in two situations:
+//   - an out-of-order gap leaves next_seq_expected behind last_byte_rcvd, so
+//     the buffered bytes past the gap are not readable yet;
+//   - a received FIN advances next_seq_expected past last_byte_rcvd, because
+//     the FIN consumes a sequence number without carrying a data byte.
+static uint32_t readable_end(cmu_socket_t *sock) {
+  return before(sock->window.next_seq_expected, sock->window.last_byte_rcvd)
+             ? sock->window.next_seq_expected
+             : sock->window.last_byte_rcvd;
+}
+
 int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
-  uint8_t *new_buf;
   int read_len = 0;
 
   if (length < 0) {
@@ -149,32 +172,28 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
 
   switch (flags) {
     case NO_FLAG:
-      while (sock->received_len == 0) {
+      while (readable_end(sock) == sock->window.last_byte_read) {
         pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
       }
     // Fall through.
-    case NO_WAIT:
-      if (sock->received_len > 0) {
-        if (sock->received_len > length)
-          read_len = length;
-        else
-          read_len = sock->received_len;
+    case NO_WAIT: {
+      uint32_t available = readable_end(sock) - sock->window.last_byte_read;
+      if (available > 0) {
+        read_len = available < (uint32_t)length ? (int)available : length;
 
-        memcpy(buf, sock->received_buf, read_len);
-        if (read_len < sock->received_len) {
-          new_buf = malloc(sock->received_len - read_len);
-          memcpy(new_buf, sock->received_buf + read_len,
-                 sock->received_len - read_len);
-          free(sock->received_buf);
-          sock->received_len -= read_len;
-          sock->received_buf = new_buf;
+        uint32_t start = sock->window.last_byte_read % MAX_NETWORK_BUFFER;
+        uint32_t first_chunk = MAX_NETWORK_BUFFER - start;
+        if ((uint32_t)read_len <= first_chunk) {
+          memcpy(buf, sock->received_buf + start, read_len);
         } else {
-          free(sock->received_buf);
-          sock->received_buf = NULL;
-          sock->received_len = 0;
+          memcpy(buf, sock->received_buf + start, first_chunk);
+          memcpy((uint8_t *)buf + first_chunk, sock->received_buf,
+                 read_len - first_chunk);
         }
+        sock->window.last_byte_read += read_len;
       }
       break;
+    }
     default:
       perror("ERROR Unknown flag.\n");
       read_len = EXIT_ERROR;

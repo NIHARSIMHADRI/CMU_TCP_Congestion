@@ -44,11 +44,97 @@ static int same_peer(const struct sockaddr_in *a,
          a->sin_port == b->sin_port;
 }
 
+// CP2 instrumentation: append a cwnd/ssthresh sample for plotting the
+// sawtooth. Set CMU_TCP_CWND_LOG to a file path to enable. `stage` is a
+// free-form label supplied by the caller.
+static void log_cwnd(cmu_socket_t *sock, const char *stage) {
+  static FILE *log_file = NULL;
+  static int checked = 0;
+  if (!checked) {
+    checked = 1;
+    const char *path = getenv("CMU_TCP_CWND_LOG");
+    if (path != NULL) {
+      log_file = fopen(path, "w");
+      if (log_file != NULL) {
+        fprintf(log_file, "time_ms,cwnd,ssthresh,adv_window,stage\n");
+      }
+    }
+  }
+  if (log_file == NULL) return;
+  fprintf(log_file, "%lld,%u,%u,%u,%s\n", (long long)monotonic_ms(),
+          sock->window.cwnd, sock->window.ssthresh,
+          sock->window.peer_adv_window, stage);
+  fflush(log_file);
+}
+
+// CP2 congestion control (TCP Reno), applied on every ACK that either
+// advances last_ack_received or repeats it while data is outstanding.
+//
+//   slow start (cwnd < ssthresh) : new ACK -> cwnd += MSS
+//   congestion avoidance         : new ACK -> cwnd += MSS * (MSS / cwnd)
+//   third duplicate ACK          : ssthresh = cwnd / 2
+//                                  cwnd = ssthresh + 3 * MSS, enter recovery
+//   duplicate ACK in recovery    : cwnd += MSS
+//   new ACK in recovery          : cwnd = ssthresh, leave recovery
+//
+// Timeout handling lives in window_send(), which owns the retransmit timer.
+static void cc_on_ack(cmu_socket_t *sock, int advanced) {
+  if (advanced) {
+    sock->window.dup_ack_count = 0;
+    if (sock->window.in_fast_recovery) {
+      sock->window.in_fast_recovery = 0;
+      sock->window.cwnd = sock->window.ssthresh;
+      log_cwnd(sock, "recovery_exit");
+      return;
+    }
+    if (sock->window.cwnd < sock->window.ssthresh) {
+      sock->window.cwnd += MSS;
+      log_cwnd(sock, "slow_start");
+    } else {
+      // Per-ACK form of "+1 MSS per RTT".
+      uint32_t increment = (uint32_t)MSS * (uint32_t)MSS / sock->window.cwnd;
+      // Guard against integer truncation stalling growth entirely.
+      if (increment == 0) increment = 1;
+      sock->window.cwnd += increment;
+      log_cwnd(sock, "congestion_avoidance");
+    }
+    return;
+  }
+
+  if (sock->window.in_fast_recovery) {
+    // Each duplicate means one more packet has drained out of the network,
+    // so one more packet's worth of data may be put in flight.
+    sock->window.cwnd += MSS;
+    log_cwnd(sock, "recovery_inflate");
+    return;
+  }
+
+  sock->window.dup_ack_count++;
+  if (sock->window.dup_ack_count == 3) {
+    sock->window.ssthresh = sock->window.cwnd / 2;
+    sock->window.cwnd = sock->window.ssthresh + 3 * MSS;
+    sock->window.in_fast_recovery = 1;
+    sock->window.fast_retransmit_pending = 1;
+    log_cwnd(sock, "fast_retransmit");
+  }
+}
+
+// CP2 flow control: how much room is left in our fixed-size receive buffer.
+// occupied = last_byte_rcvd - last_byte_read covers both the contiguous
+// prefix and any buffered out-of-order bytes ahead of the single gap.
+static uint16_t advertised_window(cmu_socket_t *sock) {
+  uint32_t occupied = sock->window.last_byte_rcvd - sock->window.last_byte_read;
+  if (occupied > MAX_NETWORK_BUFFER) return 0;
+  uint32_t space = MAX_NETWORK_BUFFER - occupied;
+  return space > UINT16_MAX ? UINT16_MAX : (uint16_t)space;
+}
+
 static int send_handshake_packet(cmu_socket_t *sock, uint8_t flags,
                                  uint32_t seq, uint32_t ack) {
   uint16_t len = sizeof(cmu_tcp_header_t);
   uint8_t *pkt = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
-                               seq, ack, len, len, flags, 1, 0, NULL, NULL, 0);
+                               seq, ack, len, len, flags,
+                               advertised_window(sock), 0, NULL, NULL, 0);
   if (pkt == NULL) return EXIT_ERROR;
   ssize_t sent = sendto(sock->socket, pkt, len, 0,
                         (struct sockaddr *)&sock->conn, sizeof(sock->conn));
@@ -85,21 +171,31 @@ static int receive_handshake_packet(cmu_socket_t *sock, cmu_tcp_header_t *hdr,
 static int tcp_handshake(cmu_socket_t *sock) {
   FILE *random = fopen("/dev/urandom", "rb");
   if (random == NULL) return EXIT_ERROR;
+  // Get a random sequence number and intitalise it (for each sock client / server)
   size_t count = fread(&sock->local_isn, sizeof(sock->local_isn), 1, random);
   fclose(random);
   if (count != 1) return EXIT_ERROR;
 
+
+  // The listener's flag will wait for the SYN
   int waiting_for_syn = sock->type == TCP_LISTENER;
   uint8_t outgoing = SYN_FLAG_MASK;
   uint32_t outgoing_ack = 0;
+// --- START----
+  // Send SYN if you are client/Sender and start the handshake.
   if (!waiting_for_syn &&
       send_handshake_packet(sock, outgoing, sock->local_isn, 0) < 0) {
     return EXIT_ERROR;
   }
+
+  // initialise deadline for sender
   int64_t deadline = monotonic_ms() + DEFAULT_TIMEOUT;
 
   while (1) {
     int64_t remaining = deadline - monotonic_ms();
+
+    // client  timedout rest timer
+    // time out situation would need a slow start here.
     if (!waiting_for_syn && remaining <= 0) {
       if (send_handshake_packet(sock, outgoing, sock->local_isn,
                                 outgoing_ack) < 0) return EXIT_ERROR;
@@ -110,43 +206,70 @@ static int tcp_handshake(cmu_socket_t *sock) {
     int timeout = waiting_for_syn ? 100 : (int)MIN(remaining, 100);
     cmu_tcp_header_t hdr;
     struct sockaddr_in peer;
+
+    // Receive doesnt matter if you are client or server both will receive at some point.
     int received = receive_handshake_packet(sock, &hdr, &peer, timeout);
     if (received < 0) return EXIT_ERROR;
     if (received == 0) continue;
 
     uint8_t flags = get_flags(&hdr);
+
+    // server
     if (waiting_for_syn) {
+        // this is not a start handshake message, wait for it, server will only send SYN-ACK.
       if (flags != SYN_FLAG_MASK) continue;
+
       sock->conn = peer;
       sock->peer_isn = get_seq(&hdr);
       outgoing = SYN_FLAG_MASK | ACK_FLAG_MASK;
       outgoing_ack = sock->peer_isn + 1;
       if (send_handshake_packet(sock, outgoing, sock->local_isn,
                                 outgoing_ack) < 0) return EXIT_ERROR;
+    // as a server only will now wait for a ack
       waiting_for_syn = 0;
       deadline = monotonic_ms() + DEFAULT_TIMEOUT;
       continue;
     }
+    // if you are not the client that this message is meant for 
     if (!same_peer(&peer, &sock->conn)) continue;
 
+    // Client
     if (sock->type == TCP_INITIATOR) {
+        // not syn-ack and not the required ack that it needs
       if (flags != (SYN_FLAG_MASK | ACK_FLAG_MASK) ||
           get_ack(&hdr) != sock->local_isn + 1) continue;
       sock->peer_isn = get_seq(&hdr);
+
+      // ACK the SYN-ACK
       if (send_handshake_packet(sock, ACK_FLAG_MASK, sock->local_isn + 1,
                                 sock->peer_isn + 1) < 0) return EXIT_ERROR;
-    } else {
+    }
+    // Server/ Listener's state when it is not waiting for a syn. 
+    else {
+    // I sent you my syn-ack but you didnt receive it so you sent a syn again, but now i am not waiting for it.
       if (flags == SYN_FLAG_MASK && get_seq(&hdr) == sock->peer_isn) {
         if (send_handshake_packet(sock, outgoing, sock->local_isn,
                                   outgoing_ack) < 0) return EXIT_ERROR;
         continue;
       }
+
+      // Corrupted packet handling
       if (flags != ACK_FLAG_MASK || get_ack(&hdr) != sock->local_isn + 1 ||
           get_seq(&hdr) != sock->peer_isn + 1) continue;
     }
     sock->window.next_seq_to_send = sock->local_isn + 1;
     sock->window.last_ack_received = sock->local_isn + 1;
     sock->window.next_seq_expected = sock->peer_isn + 1;
+    // CP2 receive buffer bookkeeping starts aligned with the SYN-consumed
+    // sequence number, same as next_seq_expected.
+    sock->window.last_byte_rcvd = sock->peer_isn + 1;
+    sock->window.last_byte_read = sock->peer_isn + 1;
+    // Seed the peer's advertised window from the handshake so the first
+    // send is not gated on having received a data ACK yet.
+    if (get_advertised_window(&hdr) > 0) {
+      sock->window.peer_adv_window = get_advertised_window(&hdr);
+    }
+    log_cwnd(sock, "init");
     return EXIT_SUCCESS;
   }
 }
@@ -285,29 +408,67 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
 
   if (flags & ACK_FLAG_MASK) {
     uint32_t ack = get_ack(hdr);
-    if (after(ack, sock->window.last_ack_received) &&
-        !after(ack, sock->window.next_seq_to_send)) {
+    // CP2 flow control: record the peer's current receive capacity.
+    sock->window.peer_adv_window = get_advertised_window(hdr);
+
+    int advanced = after(ack, sock->window.last_ack_received) &&
+                   !after(ack, sock->window.next_seq_to_send);
+    // A repeat only counts as a duplicate ACK if we actually have data in
+    // flight; otherwise a pure receiver would count the ACKs piggybacked on
+    // incoming data packets and trip fast retransmit with nothing to resend.
+    int duplicate = ack == sock->window.last_ack_received &&
+                    sock->window.next_seq_to_send !=
+                        sock->window.last_ack_received;
+    if (advanced) {
       sock->window.last_ack_received = ack;
+    }
+    if (advanced || duplicate) {
+      cc_on_ack(sock, advanced);
     }
   }
 
   uint16_t payload_len = get_payload_len(pkt);
   if (payload_len == 0 || sock->peer_fin_received) return;
-  if (get_seq(hdr) == sock->window.next_seq_expected) {
-    uint8_t *buf = realloc(sock->received_buf,
-                            sock->received_len + payload_len);
-    if (buf == NULL) {
-      perror("CMU-TCP receive allocation");
-      return;
-    }
-    sock->received_buf = buf;
-    memcpy(buf + sock->received_len, get_payload(pkt), payload_len);
-    sock->received_len += payload_len;
-    sock->window.next_seq_expected += payload_len;
+
+  uint32_t seq = get_seq(hdr);
+
+  // Drop data the receive window has no room for (sender should respect our
+  // advertised window, but don't write past the buffer regardless).
+  uint32_t occupied = sock->window.last_byte_rcvd - sock->window.last_byte_read;
+  if (occupied + payload_len > MAX_NETWORK_BUFFER) return;
+  // Already fully delivered to the application — nothing new to store, but
+  // still fall through to re-ACK so the peer learns where we are.
+  if (!after(seq + payload_len, sock->window.last_byte_read)) {
+    send_handshake_packet(sock, ACK_FLAG_MASK, sock->window.next_seq_to_send,
+                          sock->window.next_seq_expected);
+    return;
+  }
+
+  // Place the payload at its position in the circular buffer, regardless of
+  // whether it arrived in order. Writes may wrap past MAX_NETWORK_BUFFER.
+  uint32_t index = seq % MAX_NETWORK_BUFFER;
+  uint8_t *payload = get_payload(pkt);
+  uint32_t first_chunk = MAX_NETWORK_BUFFER - index;
+  if (payload_len <= first_chunk) {
+    memcpy(sock->received_buf + index, payload, payload_len);
+  } else {
+    memcpy(sock->received_buf + index, payload, first_chunk);
+    memcpy(sock->received_buf, payload + first_chunk, payload_len - first_chunk);
+  }
+  if (after(seq + payload_len, sock->window.last_byte_rcvd)) {
+    sock->window.last_byte_rcvd = seq + payload_len;
+  }
+
+  if (seq == sock->window.next_seq_expected) {
+    // Single-gap design: once the missing piece at the frontier arrives,
+    // everything up to last_byte_rcvd is already contiguous in the buffer.
+    sock->window.next_seq_expected = sock->window.last_byte_rcvd;
     // Wake the application even while our sender is waiting for its own ACKs.
     pthread_cond_signal(&sock->wait_cond);
   }
-  // Out-of-order and duplicate data are discarded; ACK the contiguous prefix.
+  // Out-of-order data (seq != next_seq_expected) is buffered above but does
+  // not advance next_seq_expected; the repeated ACK below signals the gap.
+
   send_handshake_packet(sock, ACK_FLAG_MASK, sock->window.next_seq_to_send,
                         sock->window.next_seq_expected);
 }
@@ -411,7 +572,8 @@ static int send_data_packet(cmu_socket_t *sock, outstanding_packet_t *entry) {
   uint16_t plen = hlen + entry->len;
   uint8_t *pkt = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
                                entry->seq, sock->window.next_seq_expected,
-                               hlen, plen, ACK_FLAG_MASK, 1, 0, NULL,
+                               hlen, plen, ACK_FLAG_MASK,
+                               advertised_window(sock), 0, NULL,
                                entry->payload, entry->len);
   if (pkt == NULL) return EXIT_ERROR;
   ssize_t sent = sendto(sock->socket, pkt, plen, 0,
@@ -426,25 +588,57 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
   int64_t deadline = 0;
   int result = EXIT_SUCCESS;
 
+
+  // MOVE THROUGH THE DATA IN THE BUFFER.
   while (offset < buf_len || head != NULL) {
     uint32_t ack = sock->window.last_ack_received;
+
+    // Move the head to the data that has not been yet acked 
+    // and free the other data from the buffer it has been processed
     while (head != NULL && !after(head->seq + head->len, ack)) {
       outstanding_packet_t *done = head;
       head = head->next;
       free(done);
     }
+
+    // We are starting with a no data buffer.
     if (head == NULL) {
       tail = NULL;
       deadline = 0;
-    } else if (after(ack, head->seq)) {
+    } 
+    else if (after(ack, head->seq)) {
       uint32_t covered = ack - head->seq;
       head->seq = ack;
       head->payload += covered;
       head->len -= covered;
     }
 
+    // CP2 fast retransmit: three duplicate ACKs pinpointed the hole at the
+    // head of the queue, so resend that one packet only -- unlike a timeout,
+    // which resends the whole queue.
+    if (sock->window.fast_retransmit_pending) {
+      sock->window.fast_retransmit_pending = 0;
+      if (head != NULL) {
+        if (send_data_packet(sock, head) < 0) {
+          result = EXIT_ERROR;
+          goto cleanup;
+        }
+        deadline = monotonic_ms() + DEFAULT_TIMEOUT;
+      }
+    }
+
     // Timeout recovery uses the same outstanding queue, in sequence order.
+    // slow start again here 
     if (head != NULL && monotonic_ms() >= deadline) {
+      // CP2: a timeout means nothing is getting through. Halve ssthresh from
+      // where cwnd had reached and restart at the initial slow-start window,
+      // abandoning any fast recovery in progress.
+      sock->window.ssthresh = sock->window.cwnd / 2;
+      sock->window.cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+      sock->window.in_fast_recovery = 0;
+      sock->window.dup_ack_count = 0;
+      log_cwnd(sock, "timeout");
+        // go back N logic
       for (outstanding_packet_t *entry = head; entry; entry = entry->next) {
         if (send_data_packet(sock, entry) < 0) {
           result = EXIT_ERROR;
@@ -454,13 +648,21 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       deadline = monotonic_ms() + DEFAULT_TIMEOUT;
     }
 
+
     while (offset < buf_len) {
+
+      // len is the length of data we can send for a cumulative ack.
       uint16_t len = MIN((uint32_t)(buf_len - offset), (uint32_t)MSS);
+
+      // The effective window size right now
       uint32_t outstanding = sock->window.next_seq_to_send -
                              sock->window.last_ack_received;
+      // CP2: bounded by both the peer's receive capacity and the congestion
+      // window, per the handout's min(advertised window, cwnd).
+      uint32_t send_window = MIN((uint32_t)sock->window.peer_adv_window,
+                                 sock->window.cwnd);
       // Preserve the student's rule: do not shrink a packet to fill a gap.
-      if (outstanding > CP1_WINDOW_SIZE ||
-          len > CP1_WINDOW_SIZE - outstanding) break;
+      if (outstanding > send_window || len > send_window - outstanding) break;
       outstanding_packet_t *entry = malloc(sizeof(*entry));
       if (entry == NULL) {
         result = EXIT_ERROR;
@@ -485,6 +687,7 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       offset += len;
     }
 
+    // I have to poll for any action on my ques so that I can get acks and do something about my queue.
     if (head != NULL) {
       int64_t remaining = deadline - monotonic_ms();
       struct pollfd fd = {.fd = sock->socket, .events = POLLIN};
@@ -512,6 +715,7 @@ void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   int death, buf_len, send_signal;
   uint8_t *data;
+  int64_t teardown_giveup_deadline = 0;  // STOPGAP, see below.
 
   if (tcp_handshake(sock) < 0) {
     fprintf(stderr, "CMU-TCP handshake failed or was interrupted\n");
@@ -530,11 +734,25 @@ void *begin_backend(void *in) {
 
     if (death && buf_len == 0) {
       pthread_mutex_unlock(&sock->send_lock);
-      if (sock->close_state == CLOSE_OPEN && start_teardown(sock) < 0) {
-        perror("CMU-TCP teardown send");
-        return NULL;
+      if (sock->close_state == CLOSE_OPEN) {
+        if (start_teardown(sock) < 0) {
+          perror("CMU-TCP teardown send");
+          return NULL;
+        }
+        // STOPGAP (not part of the original teardown design): bound how long
+        // we'll wait for a peer that never responds to our FIN at all, so
+        // cmu_close() can't hang forever. Pre-existing CP1 teardown behavior
+        // has no such bound; flagged here for the owning student to revisit.
+        teardown_giveup_deadline = monotonic_ms() + 5LL * DEFAULT_TIMEOUT;
       }
       if (sock->close_state == CLOSE_DONE) break;
+      if (teardown_giveup_deadline != 0 &&
+          monotonic_ms() >= teardown_giveup_deadline) {
+        fprintf(stderr,
+                "CMU-TCP teardown STOPGAP: giving up, peer never "
+                "completed the FIN exchange\n");
+        break;
+      }
       if (monotonic_ms() >= sock->close_deadline) {
         if (sock->close_state == CLOSE_LINGER) break;
         if (resend_close_packet(sock) < 0) {
@@ -568,7 +786,13 @@ void *begin_backend(void *in) {
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
     }
 
-    send_signal = sock->received_len > 0;
+    // Readable bytes must be both contiguous and actual payload; see
+    // readable_end() in cmu_tcp.c for why the two bounds can differ.
+    uint32_t readable =
+        before(sock->window.next_seq_expected, sock->window.last_byte_rcvd)
+            ? sock->window.next_seq_expected
+            : sock->window.last_byte_rcvd;
+    send_signal = readable != sock->window.last_byte_read;
 
     pthread_mutex_unlock(&(sock->recv_lock));
 

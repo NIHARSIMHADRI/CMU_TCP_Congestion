@@ -31,6 +31,29 @@ typedef struct {
   uint32_t next_seq_expected;
   uint32_t last_ack_received;
   uint32_t next_seq_to_send;
+  // CP2: tracks the farthest byte physically written into received_buf so
+  // far (covers the single out-of-order gap between next_seq_expected and
+  // this value), and how far the application has consumed via cmu_read().
+  uint32_t last_byte_rcvd;
+  uint32_t last_byte_read;
+
+  // CP2 congestion control. Initial values are fixed by grading.h:
+  // cwnd starts at WINDOW_INITIAL_WINDOW_SIZE, ssthresh at
+  // WINDOW_INITIAL_SSTHRESH.
+  uint32_t cwnd;
+  uint32_t ssthresh;
+  // Most recent advertised window reported by the peer. The effective
+  // sending window is min(cwnd, peer_adv_window).
+  uint16_t peer_adv_window;
+  // Consecutive ACKs received carrying the same (non-advancing) ack number.
+  uint32_t dup_ack_count;
+  // Set while in fast recovery. Slow start vs. congestion avoidance is
+  // derived from cwnd < ssthresh, but recovery needs its own marker because
+  // cwnd is deliberately inflated above ssthresh while recovering.
+  int in_fast_recovery;
+  // Raised by the ACK handler when three duplicates have been counted, and
+  // consumed by window_send(), which owns the outstanding-packet queue.
+  int fast_retransmit_pending;
 } window_t;
 
 /**
@@ -50,8 +73,10 @@ typedef struct {
   pthread_t thread_id;
   uint16_t my_port;
   struct sockaddr_in conn;
+  // Fixed-size (MAX_NETWORK_BUFFER) circular buffer. Occupied bytes span
+  // [window.last_byte_read, window.last_byte_rcvd); use `% MAX_NETWORK_BUFFER`
+  // on sequence numbers to find a byte's position.
   uint8_t* received_buf;
-  int received_len;
   pthread_mutex_t recv_lock;
   pthread_cond_t wait_cond;
   uint8_t* sending_buf;
