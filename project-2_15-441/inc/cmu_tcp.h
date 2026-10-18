@@ -54,6 +54,12 @@ typedef struct {
   // Raised by the ACK handler when three duplicates have been counted, and
   // consumed by window_send(), which owns the outstanding-packet queue.
   int fast_retransmit_pending;
+  // Most recent advertised window we actually put on the wire. Used to tell
+  // whether the peer is currently blocked by a window too small to use.
+  uint16_t last_adv_sent;
+  // Raised by cmu_read() once enough space frees up to be worth announcing,
+  // and consumed by the backend thread, which owns all transmission.
+  int window_update_pending;
 } window_t;
 
 /**

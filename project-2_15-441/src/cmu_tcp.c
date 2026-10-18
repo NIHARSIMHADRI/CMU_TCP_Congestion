@@ -69,6 +69,8 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.dup_ack_count = 0;
   sock->window.in_fast_recovery = 0;
   sock->window.fast_retransmit_pending = 0;
+  sock->window.last_adv_sent = MAX_NETWORK_BUFFER;
+  sock->window.window_update_pending = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
@@ -191,6 +193,21 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
                  read_len - first_chunk);
         }
         sock->window.last_byte_read += read_len;
+
+        // CP2 zero-window recovery. The peer only ACKs in response to data,
+        // so if we previously advertised a window it cannot send into, it is
+        // waiting on us and no amount of waiting will change that. Once at
+        // least one MSS has freed up, ask the backend thread to announce the
+        // reopened window. The MSS threshold keeps us from announcing every
+        // few bytes and provoking a stream of tiny packets.
+        uint32_t occupied =
+            sock->window.last_byte_rcvd - sock->window.last_byte_read;
+        uint32_t space = occupied > MAX_NETWORK_BUFFER
+                             ? 0
+                             : MAX_NETWORK_BUFFER - occupied;
+        if (sock->window.last_adv_sent < MSS && space >= MSS) {
+          sock->window.window_update_pending = 1;
+        }
       }
       break;
     }

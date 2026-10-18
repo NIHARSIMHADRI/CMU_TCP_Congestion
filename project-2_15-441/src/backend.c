@@ -67,6 +67,17 @@ static void log_cwnd(cmu_socket_t *sock, const char *stage) {
   fflush(log_file);
 }
 
+// Multiplicative decrease, with a floor so repeated losses cannot drive
+// ssthresh below two segments. Without any floor it decays geometrically
+// (observed reaching 687 bytes). The floor is 2 * MSS rather than MSS so it
+// stays strictly above the post-timeout cwnd of WINDOW_INITIAL_WINDOW_SIZE;
+// at exactly MSS the cwnd < ssthresh test would still fail and slow start
+// would remain unreachable.
+static uint32_t halved_ssthresh(uint32_t cwnd) {
+  uint32_t half = cwnd / 2;
+  return half < 2 * (uint32_t)MSS ? 2 * (uint32_t)MSS : half;
+}
+
 // CP2 congestion control (TCP Reno), applied on every ACK that either
 // advances last_ack_received or repeats it while data is outstanding.
 //
@@ -111,7 +122,7 @@ static void cc_on_ack(cmu_socket_t *sock, int advanced) {
 
   sock->window.dup_ack_count++;
   if (sock->window.dup_ack_count == 3) {
-    sock->window.ssthresh = sock->window.cwnd / 2;
+    sock->window.ssthresh = halved_ssthresh(sock->window.cwnd);
     sock->window.cwnd = sock->window.ssthresh + 3 * MSS;
     sock->window.in_fast_recovery = 1;
     sock->window.fast_retransmit_pending = 1;
@@ -124,9 +135,14 @@ static void cc_on_ack(cmu_socket_t *sock, int advanced) {
 // prefix and any buffered out-of-order bytes ahead of the single gap.
 static uint16_t advertised_window(cmu_socket_t *sock) {
   uint32_t occupied = sock->window.last_byte_rcvd - sock->window.last_byte_read;
-  if (occupied > MAX_NETWORK_BUFFER) return 0;
-  uint32_t space = MAX_NETWORK_BUFFER - occupied;
-  return space > UINT16_MAX ? UINT16_MAX : (uint16_t)space;
+  uint32_t space = occupied > MAX_NETWORK_BUFFER
+                       ? 0
+                       : MAX_NETWORK_BUFFER - occupied;
+  if (space > UINT16_MAX) space = UINT16_MAX;
+  // Remember what we told the peer so cmu_read() can tell whether the peer
+  // is currently stuck on a window too small to send into.
+  sock->window.last_adv_sent = (uint16_t)space;
+  return (uint16_t)space;
 }
 
 static int send_handshake_packet(cmu_socket_t *sock, uint8_t flags,
@@ -460,9 +476,13 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   }
 
   if (seq == sock->window.next_seq_expected) {
-    // Single-gap design: once the missing piece at the frontier arrives,
-    // everything up to last_byte_rcvd is already contiguous in the buffer.
-    sock->window.next_seq_expected = sock->window.last_byte_rcvd;
+    // Advance only over bytes this packet actually delivered. Jumping to
+    // last_byte_rcvd would be faster, but last_byte_rcvd is only a high-water
+    // mark -- it says nothing about whether every byte beneath it arrived. If
+    // two packets in the same window were lost, jumping declares the second
+    // hole received, hands the application uninitialised buffer bytes, and
+    // ACKs data the sender then discards, losing it permanently.
+    sock->window.next_seq_expected += payload_len;
     // Wake the application even while our sender is waiting for its own ACKs.
     pthread_cond_signal(&sock->wait_cond);
   }
@@ -633,7 +653,7 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       // CP2: a timeout means nothing is getting through. Halve ssthresh from
       // where cwnd had reached and restart at the initial slow-start window,
       // abandoning any fast recovery in progress.
-      sock->window.ssthresh = sock->window.cwnd / 2;
+      sock->window.ssthresh = halved_ssthresh(sock->window.cwnd);
       sock->window.cwnd = WINDOW_INITIAL_WINDOW_SIZE;
       sock->window.in_fast_recovery = 0;
       sock->window.dup_ack_count = 0;
@@ -651,9 +671,6 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
 
     while (offset < buf_len) {
 
-      // len is the length of data we can send for a cumulative ack.
-      uint16_t len = MIN((uint32_t)(buf_len - offset), (uint32_t)MSS);
-
       // The effective window size right now
       uint32_t outstanding = sock->window.next_seq_to_send -
                              sock->window.last_ack_received;
@@ -661,8 +678,17 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       // window, per the handout's min(advertised window, cwnd).
       uint32_t send_window = MIN((uint32_t)sock->window.peer_adv_window,
                                  sock->window.cwnd);
-      // Preserve the student's rule: do not shrink a packet to fill a gap.
-      if (outstanding > send_window || len > send_window - outstanding) break;
+      if (outstanding >= send_window) break;
+      uint32_t room = send_window - outstanding;
+
+      // CP2: clamp the segment to the space actually on offer rather than
+      // insisting on a full MSS. MAX_NETWORK_BUFFER is not a multiple of MSS
+      // (65535 = 47*1375 + 910), so a full receive buffer always leaves a
+      // sub-MSS remainder; refusing to use it stalls the sender outright.
+      uint16_t len = (uint16_t)MIN(MIN((uint32_t)(buf_len - offset),
+                                       (uint32_t)MSS),
+                                   room);
+      if (len == 0) break;
       outstanding_packet_t *entry = malloc(sizeof(*entry));
       if (entry == NULL) {
         result = EXIT_ERROR;
@@ -688,8 +714,12 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
     }
 
     // I have to poll for any action on my ques so that I can get acks and do something about my queue.
-    if (head != NULL) {
-      int64_t remaining = deadline - monotonic_ms();
+    // Wait even with an empty queue: the send gate above can block purely on
+    // the peer's advertised window, and the only way that value changes is by
+    // reading an incoming packet. Spinning here would busy-loop forever.
+    {
+      int64_t remaining = head != NULL ? deadline - monotonic_ms() : 100;
+      if (remaining > 100) remaining = 100;
       struct pollfd fd = {.fd = sock->socket, .events = POLLIN};
       if (remaining > 0) {
         int ready = poll(&fd, 1, (int)remaining);
@@ -794,7 +824,18 @@ void *begin_backend(void *in) {
             : sock->window.last_byte_rcvd;
     send_signal = readable != sock->window.last_byte_read;
 
+    // cmu_read() raised this when the application drained enough space to be
+    // worth telling the peer about. All transmission stays on this thread.
+    int announce_window = sock->window.window_update_pending;
+    sock->window.window_update_pending = 0;
+
     pthread_mutex_unlock(&(sock->recv_lock));
+
+    if (announce_window) {
+      // A pure ACK; its advertised_window field carries the reopened window.
+      send_handshake_packet(sock, ACK_FLAG_MASK, sock->window.next_seq_to_send,
+                            sock->window.next_seq_expected);
+    }
 
     if (send_signal) {
       pthread_cond_signal(&(sock->wait_cond));
