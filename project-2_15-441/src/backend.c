@@ -765,7 +765,9 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       if (probe_deadline == 0) {
         probe_deadline = now + ZERO_WINDOW_PROBE_MS;
       } else if (now >= probe_deadline) {
-        uint16_t len = MIN((uint32_t)(buf_len - offset), (uint32_t)MSS);
+        // One byte only. The point is to provoke an ACK, not to move data,
+        // and a closed window must not be overrun by a full segment.
+        uint16_t len = 1;
         outstanding_packet_t *entry = malloc(sizeof(*entry));
         if (entry == NULL) {
           result = EXIT_ERROR;

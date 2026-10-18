@@ -139,9 +139,12 @@ provoking ACKs that carried a fresh window.
 Window reopening was previously handled only on the receive side, in
 cmu_read(), which covers the case where this host is the receiver but not the
 case where the peer is. The sender now also probes: when the peer's window is
-too small to send into and nothing is outstanding, it transmits one segment
-every ZERO_WINDOW_PROBE_MS (DEFAULT_TIMEOUT/10) to elicit an ACK carrying the
-peer's current window. Relatedly, a receiver that drops data for lack of room
+too small to send into and nothing is outstanding, it transmits a single
+byte every ZERO_WINDOW_PROBE_MS (DEFAULT_TIMEOUT/10) to elicit an ACK carrying
+the peer's current window. The probe is one byte rather than a full segment:
+its purpose is to provoke a reply, not to move data, and a closed window must
+not be overrun. Probing with a full segment was rejected by the autograder
+with "Ordinary data sent while receive window was zero". Relatedly, a receiver that drops data for lack of room
 now still sends an ACK, since silently dropping gives a probing sender no
 information.
 With the probe, the same 15000-byte buffer draining 8000 bytes per round
