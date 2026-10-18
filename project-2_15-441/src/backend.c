@@ -32,6 +32,11 @@
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 
+// How long to wait before re-probing a peer that advertised a window too
+// small to send into. Kept well under DEFAULT_TIMEOUT so a closed window
+// reopens promptly rather than costing a full retransmission timeout.
+#define ZERO_WINDOW_PROBE_MS (DEFAULT_TIMEOUT / 10)
+
 static int64_t monotonic_ms(void) {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -454,9 +459,15 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   uint32_t seq = get_seq(hdr);
 
   // Drop data the receive window has no room for (sender should respect our
-  // advertised window, but don't write past the buffer regardless).
+  // advertised window, but don't write past the buffer regardless). Still
+  // ACK it: the ACK carries our current advertised window, which is the only
+  // way a sender probing a closed window learns whether it has reopened.
   uint32_t occupied = sock->window.last_byte_rcvd - sock->window.last_byte_read;
-  if (occupied + payload_len > MAX_NETWORK_BUFFER) return;
+  if (occupied + payload_len > MAX_NETWORK_BUFFER) {
+    send_handshake_packet(sock, ACK_FLAG_MASK, sock->window.next_seq_to_send,
+                          sock->window.next_seq_expected);
+    return;
+  }
   // Already fully delivered to the application — nothing new to store, but
   // still fall through to re-ACK so the peer learns where we are.
   if (!after(seq + payload_len, sock->window.last_byte_read)) {
@@ -615,6 +626,7 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
 
 
   uint32_t last_seen_ack = sock->window.last_ack_received;
+  int64_t probe_deadline = 0;   // zero-window probe, see below
 
   // MOVE THROUGH THE DATA IN THE BUFFER.
   while (offset < buf_len || head != NULL) {
@@ -740,6 +752,42 @@ static int window_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
       tail = entry;
       sock->window.next_seq_to_send += len;
       offset += len;
+    }
+
+    // Zero-window probe. If the peer advertised a window too small to accept
+    // even one segment, the loop above sent nothing, so there is nothing
+    // outstanding and the retransmission timer never arms. Nothing would then
+    // ever prompt the peer to report that its window reopened, and the sender
+    // would wait forever. Periodically send one segment anyway to elicit an
+    // ACK, which carries the peer's current advertised window.
+    if (head == NULL && offset < buf_len) {
+      int64_t now = monotonic_ms();
+      if (probe_deadline == 0) {
+        probe_deadline = now + ZERO_WINDOW_PROBE_MS;
+      } else if (now >= probe_deadline) {
+        uint16_t len = MIN((uint32_t)(buf_len - offset), (uint32_t)MSS);
+        outstanding_packet_t *entry = malloc(sizeof(*entry));
+        if (entry == NULL) {
+          result = EXIT_ERROR;
+          goto cleanup;
+        }
+        entry->seq = sock->window.next_seq_to_send;
+        entry->len = len;
+        entry->payload = data + offset;
+        entry->next = NULL;
+        if (send_data_packet(sock, entry) < 0) {
+          free(entry);
+          result = EXIT_ERROR;
+          goto cleanup;
+        }
+        head = tail = entry;
+        sock->window.next_seq_to_send += len;
+        offset += len;
+        deadline = now + DEFAULT_TIMEOUT;
+        probe_deadline = 0;
+      }
+    } else {
+      probe_deadline = 0;
     }
 
     // I have to poll for any action on my ques so that I can get acks and do something about my queue.

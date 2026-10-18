@@ -23,7 +23,18 @@ int main(int argc, char **argv) {
   if (is_send) {
     uint8_t *data = malloc(total);
     for (int i = 0; i < total; i++) data[i] = (uint8_t)(i % 251);
-    cmu_write(&s, data, total);
+    // CMU_TCP_WRITE_CHUNK mimics an application that writes in pieces (the
+    // provided client.c uses 2000-byte freads) rather than one large write.
+    const char *chunk_env = getenv("CMU_TCP_WRITE_CHUNK");
+    int chunk = chunk_env ? atoi(chunk_env) : 0;
+    if (chunk <= 0) {
+      cmu_write(&s, data, total);
+    } else {
+      for (int off = 0; off < total; off += chunk) {
+        int n = total - off < chunk ? total - off : chunk;
+        cmu_write(&s, data + off, n);
+      }
+    }
     free(data);
   } else {
     uint8_t *buf = malloc(total);

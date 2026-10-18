@@ -13,6 +13,13 @@ H = struct.Struct('!IHHIIHHBHH')
 HDR = H.size
 MSS = 1400 - HDR
 PROBE = '/tmp/cwnd_probe'
+# DBG_RCVBUF simulates a finite receive buffer that the application never
+# drains, so the advertised window shrinks as data accumulates. Unset means
+# hold the window wide open.
+RCVBUF = int(__import__('os').environ.get('DBG_RCVBUF', '0'))
+# DBG_DRAIN simulates the receiving application consuming this many bytes per
+# round, so a buffer that filled up gradually reopens.
+DRAIN = int(__import__('os').environ.get('DBG_DRAIN', '0'))
 ADV = 65535
 
 
@@ -32,9 +39,16 @@ def main():
 
     my_isn = 7000
 
+    buffered = [0]          # bytes sitting in the simulated receive buffer
+
+    def adv_now():
+        if RCVBUF <= 0:
+            return ADV
+        return max(0, min(ADV, RCVBUF - buffered[0]))
+
     def send(seq, ack, flags):
         sock.sendto(H.pack(15441, port, 0, seq, ack % 2**32, HDR, HDR,
-                            flags, ADV, 0), peer)
+                            flags, adv_now(), 0), peer)
 
     # Handshake.
     sock.settimeout(5)
@@ -75,10 +89,13 @@ def main():
                 retrans = True
             seen.add(seq)
             flight += payload
+            buffered[0] += payload
             arrivals.append((seq, payload))
         if flight == 0:
             break
         rounds.append((flight, len(seen), retrans))
+        if DRAIN:
+            buffered[0] = max(0, buffered[0] - DRAIN)
 
         # Release the withheld ACKs, in sequence order, one per packet.
         for seq, payload in sorted(arrivals):
